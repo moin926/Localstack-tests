@@ -1,0 +1,5 @@
+dotnet add package xunit
+dotnet add package xunit.runner.visualstudio
+dotnet add package DotNet.Testcontainers
+dotnet add package AWSSDK.S3
+dotnet add package AWSSDK.SQS
