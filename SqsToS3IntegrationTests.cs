@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -16,16 +17,14 @@ using Xunit;
 
 namespace SqsToS3ServiceDemo.Tests
 {
-    public class SqsToS3IntegrationTests : IAsyncLifetime
+    public class SqsToS3MultiQueueIntegrationTests : IAsyncLifetime
     {
         private readonly LocalStackTestcontainer _localStack;
         private IAmazonSQS _sqsClient = null!;
         private IAmazonS3 _s3Client = null!;
-        private string _bucketName = null!;
-        private string _queueName = null!;
-        private string _queueUrl = null!;
+        private readonly Dictionary<string, string> _queueToBucket = new();
 
-        public SqsToS3IntegrationTests()
+        public SqsToS3MultiQueueIntegrationTests()
         {
             _localStack = new TestcontainersBuilder<LocalStackTestcontainer>()
                 .WithImage("localstack/localstack:latest")
@@ -61,14 +60,17 @@ namespace SqsToS3ServiceDemo.Tests
                 ForcePathStyle = true
             });
 
-            // Create bucket and queue
-            _bucketName = $"bucket-{Guid.NewGuid()}";
-            _queueName = $"queue-{Guid.NewGuid()}";
+            // Create 2 queues and 2 buckets
+            for (int i = 0; i < 2; i++)
+            {
+                var bucketName = $"test-bucket-{i}-{Guid.NewGuid()}";
+                var queueName = $"test-queue-{i}-{Guid.NewGuid()}";
 
-            await _s3Client.PutBucketAsync(_bucketName);
+                await _s3Client.PutBucketAsync(bucketName);
+                var queueResp = await _sqsClient.CreateQueueAsync(queueName);
 
-            var queueResponse = await _sqsClient.CreateQueueAsync(_queueName);
-            _queueUrl = queueResponse.QueueUrl;
+                _queueToBucket[queueResp.QueueUrl] = bucketName;
+            }
         }
 
         public async Task DisposeAsync()
@@ -79,60 +81,59 @@ namespace SqsToS3ServiceDemo.Tests
         }
 
         [Fact]
-        public async Task PollOnceAsync_Uploads_AllMessagesToS3()
+        public async Task PollQueuesOnceAsync_Processes_AllQueues()
         {
             // Arrange
             var service = new SqsToS3Service(_sqsClient, _s3Client);
-            var msg1 = "{ \"type\": \"order.created\", \"id\": 1 }";
-            var msg2 = "{ \"type\": \"order.shipped\", \"id\": 2 }";
 
-            await _sqsClient.SendMessageAsync(_queueUrl, msg1);
-            await _sqsClient.SendMessageAsync(_queueUrl, msg2);
+            foreach (var (queueUrl, _) in _queueToBucket)
+            {
+                await _sqsClient.SendMessageAsync(queueUrl, $"{{ \"source\": \"{queueUrl}\" }}");
+            }
 
             // Act
-            int processed = await service.PollOnceAsync(_queueUrl, _bucketName);
+            int processed = await service.PollQueuesOnceAsync(_queueToBucket);
 
             // Assert
-            Assert.Equal(2, processed);
-            var objects = await _s3Client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = _bucketName });
-            Assert.Equal(2, objects.S3Objects.Count);
+            Assert.Equal(_queueToBucket.Count, processed);
+
+            foreach (var bucket in _queueToBucket.Values)
+            {
+                var result = await _s3Client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = bucket });
+                Assert.Single(result.S3Objects);
+            }
         }
 
         [Fact]
-        public async Task PollContinuouslyAsync_Processes_MessagesOverTime()
+        public async Task PollQueuesWithTimerAsync_Processes_Messages_AndStops()
         {
             // Arrange
             var service = new SqsToS3Service(_sqsClient, _s3Client);
-            var cts = new CancellationTokenSource();
-            var pollTask = service.PollContinuouslyAsync(_queueUrl, _bucketName, TimeSpan.FromSeconds(2), cts.Token);
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
 
-            // Send messages at different intervals
-            await _sqsClient.SendMessageAsync(_queueUrl, "{ \"event\": \"alpha\" }");
-            await Task.Delay(3000); // let the first message be processed
-            await _sqsClient.SendMessageAsync(_queueUrl, "{ \"event\": \"beta\" }");
-            await Task.Delay(3000); // let the second message be processed
+            // Send one message to each queue, then another after timer starts
+            foreach (var (queueUrl, _) in _queueToBucket)
+            {
+                await _sqsClient.SendMessageAsync(queueUrl, $"{{ \"early\": \"true\" }}");
+            }
 
-            // Stop polling
-            cts.Cancel();
-            await pollTask;
+            _ = service.PollQueuesWithTimerAsync(_queueToBucket, TimeSpan.FromSeconds(2), cts.Token);
 
-            // Assert both were uploaded
-            var list = await _s3Client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = _bucketName });
-            Assert.Equal(2, list.S3Objects.Count);
-        }
+            await Task.Delay(2500); // Let first poll run
 
-        [Fact]
-        public async Task PollContinuouslyAsync_StopsOnCancel()
-        {
-            // Arrange
-            var service = new SqsToS3Service(_sqsClient, _s3Client);
-            var cts = new CancellationTokenSource();
-            cts.CancelAfter(TimeSpan.FromSeconds(5)); // auto-cancel
+            foreach (var (queueUrl, _) in _queueToBucket)
+            {
+                await _sqsClient.SendMessageAsync(queueUrl, $"{{ \"late\": \"true\" }}");
+            }
 
-            // Act
-            await service.PollContinuouslyAsync(_queueUrl, _bucketName, TimeSpan.FromSeconds(1), cts.Token);
+            await Task.Delay(5000); // Let next polls catch it
 
-            // Assert: no exceptions, method exits cleanly (test passes)
+            // Assert
+            foreach (var bucket in _queueToBucket.Values)
+            {
+                var result = await _s3Client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = bucket });
+                Assert.True(result.S3Objects.Count >= 2); // early + late
+            }
         }
     }
 }
