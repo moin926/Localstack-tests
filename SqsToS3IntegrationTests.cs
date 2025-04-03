@@ -60,7 +60,6 @@ namespace SqsToS3ServiceDemo.Tests
                 ForcePathStyle = true
             });
 
-            // Create 2 queues and 2 buckets
             for (int i = 0; i < 2; i++)
             {
                 var bucketName = $"test-bucket-{i}-{Guid.NewGuid()}";
@@ -83,18 +82,16 @@ namespace SqsToS3ServiceDemo.Tests
         [Fact]
         public async Task PollQueuesOnceAsync_Processes_AllQueues()
         {
-            // Arrange
             var service = new SqsToS3Service(_sqsClient, _s3Client);
 
             foreach (var (queueUrl, _) in _queueToBucket)
             {
-                await _sqsClient.SendMessageAsync(queueUrl, $"{{ \"source\": \"{queueUrl}\" }}");
+                await _sqsClient.SendMessageAsync(queueUrl, $"{{ "source": "{ queueUrl}
+                " }}");
             }
 
-            // Act
             int processed = await service.PollQueuesOnceAsync(_queueToBucket);
 
-            // Assert
             Assert.Equal(_queueToBucket.Count, processed);
 
             foreach (var bucket in _queueToBucket.Values)
@@ -107,32 +104,29 @@ namespace SqsToS3ServiceDemo.Tests
         [Fact]
         public async Task PollQueuesWithTimerAsync_Processes_Messages_AndStops()
         {
-            // Arrange
             var service = new SqsToS3Service(_sqsClient, _s3Client);
             var cts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
 
-            // Send one message to each queue, then another after timer starts
             foreach (var (queueUrl, _) in _queueToBucket)
             {
-                await _sqsClient.SendMessageAsync(queueUrl, $"{{ \"early\": \"true\" }}");
+                await _sqsClient.SendMessageAsync(queueUrl, $"{{ "early": "true" }}");
             }
 
             _ = service.PollQueuesWithTimerAsync(_queueToBucket, TimeSpan.FromSeconds(2), cts.Token);
 
-            await Task.Delay(2500); // Let first poll run
+            await Task.Delay(2500);
 
             foreach (var (queueUrl, _) in _queueToBucket)
             {
-                await _sqsClient.SendMessageAsync(queueUrl, $"{{ \"late\": \"true\" }}");
+                await _sqsClient.SendMessageAsync(queueUrl, $"{{ "late": "true" }}");
             }
 
-            await Task.Delay(5000); // Let next polls catch it
+            await Task.Delay(5000);
 
-            // Assert
             foreach (var bucket in _queueToBucket.Values)
             {
                 var result = await _s3Client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = bucket });
-                Assert.True(result.S3Objects.Count >= 2); // early + late
+                Assert.True(result.S3Objects.Count >= 2);
             }
         }
     }
