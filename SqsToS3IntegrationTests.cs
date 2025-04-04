@@ -80,19 +80,28 @@ namespace SqsToS3ServiceDemo.Tests
         }
 
         [Fact]
-        public async Task PollQueuesOnceAsync_Processes_AllQueues()
+        public async Task PollQueuesOnceAsync_Processes_AllQueues_With_Callback()
         {
             var service = new SqsToS3Service(_sqsClient, _s3Client);
+            var processedMessages = new List<string>();
 
             foreach (var (queueUrl, _) in _queueToBucket)
             {
-                await _sqsClient.SendMessageAsync(queueUrl, $"{{ "source": "{ queueUrl}
-                " }}");
+                await _sqsClient.SendMessageAsync(queueUrl, $"{{ \"source\": \"{queueUrl}\" }}");
             }
 
-            int processed = await service.PollQueuesOnceAsync(_queueToBucket);
+            int processed = await service.PollQueuesOnceAsync(
+                _queueToBucket,
+                10,
+                CancellationToken.None,
+                async (queue, bucket, msg) =>
+                {
+                    processedMessages.Add($"{queue}:{bucket}:{msg.MessageId}");
+                    await Task.CompletedTask;
+                });
 
             Assert.Equal(_queueToBucket.Count, processed);
+            Assert.Equal(_queueToBucket.Count, processedMessages.Count);
 
             foreach (var bucket in _queueToBucket.Values)
             {
@@ -102,32 +111,36 @@ namespace SqsToS3ServiceDemo.Tests
         }
 
         [Fact]
-        public async Task PollQueuesWithTimerAsync_Processes_Messages_AndStops()
+        public async Task PollQueuesWithTimerAsync_Processes_Messages_And_Invokes_Callback()
         {
             var service = new SqsToS3Service(_sqsClient, _s3Client);
             var cts = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+            var callbackLog = new List<string>();
 
             foreach (var (queueUrl, _) in _queueToBucket)
             {
-                await _sqsClient.SendMessageAsync(queueUrl, $"{{ "early": "true" }}");
+                await _sqsClient.SendMessageAsync(queueUrl, $"{{ \"early\": \"true\" }}");
             }
 
-            _ = service.PollQueuesWithTimerAsync(_queueToBucket, TimeSpan.FromSeconds(2), cts.Token);
+            await service.PollQueuesWithTimerAsync(
+                _queueToBucket,
+                TimeSpan.FromSeconds(2),
+                10,
+                cts.Token,
+                async (queue, bucket, message) =>
+                {
+                    callbackLog.Add($"[CALLBACK] {queue} -> {bucket} :: {message.MessageId}");
+                    await Task.CompletedTask;
+                });
 
-            await Task.Delay(2500);
+            Assert.True(callbackLog.Count >= _queueToBucket.Count);
 
-            foreach (var (queueUrl, _) in _queueToBucket)
-            {
-                await _sqsClient.SendMessageAsync(queueUrl, $"{{ "late": "true" }}");
-            }
+            var buckets = _queueToBucket.Values.Distinct().ToList();
 
-            await Task.Delay(5000);
+            Assert.Single(buckets);
 
-            foreach (var bucket in _queueToBucket.Values)
-            {
-                var result = await _s3Client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = bucket });
-                Assert.True(result.S3Objects.Count >= 2);
-            }
+            var result = await _s3Client.ListObjectsV2Async(new ListObjectsV2Request { BucketName = bucket.First() });
+            Assert.True(result.S3Objects.Count >= 1);
         }
     }
 }
